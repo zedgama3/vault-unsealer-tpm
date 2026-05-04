@@ -3,20 +3,12 @@ package crypto
 import (
 	"bytes"
 	"fmt"
+	"log"
+
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpmutil"
-	"log"
 )
-
-// openTPM is a function variable that can be replaced by a simulator in tests.
-var openTPM = func(path string) (transport.TPMCloser, error) {
-	rwc, err := tpmutil.OpenTPM(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open TPM device %q: %v", path, err)
-	}
-	return transport.FromReadWriteCloser(rwc), nil
-}
 
 // TPM represents a TPM device with its configuration
 type TPM struct {
@@ -27,19 +19,15 @@ type TPM struct {
 
 // OpenTPM opens a TPM connection and returns a TPM instance.
 func OpenTPM(devicePath string, handle uint32) (*TPM, error) {
-	tpm := &TPM{
+	rwc, err := tpmutil.OpenTPM(devicePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open TPM device %q: %w", devicePath, err)
+	}
+	return &TPM{
 		devicePath: devicePath,
 		handle:     handle,
-	}
-
-	rwr, err := openTPM(tpm.devicePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open TPM device %q: %w", tpm.devicePath, err)
-	}
-
-	tpm.rwr = rwr
-
-	return tpm, nil
+		rwr:        transport.FromReadWriteCloser(rwc),
+	}, nil
 }
 
 // Close closes the TPM connection
@@ -128,7 +116,7 @@ var (
 	}
 )
 
-func (t *TPM) InitKey() error {
+func (t *TPM) InitKey() (retErr error) {
 	if t.rwr == nil {
 		return fmt.Errorf("TPM is closed")
 	}
@@ -183,9 +171,13 @@ func (t *TPM) InitKey() error {
 		flushContextCmd := tpm2.FlushContext{
 			FlushHandle: loadRsp.ObjectHandle,
 		}
-		_, err := flushContextCmd.Execute(t.rwr)
-		if err != nil {
-			log.Fatalf("can't close TPM %q: %v", t.devicePath, err)
+		if _, err := flushContextCmd.Execute(t.rwr); err != nil {
+			wrapped := fmt.Errorf("failed to flush TPM context %q: %w", t.devicePath, err)
+			if retErr == nil {
+				retErr = wrapped
+			} else {
+				log.Printf("%v", wrapped)
+			}
 		}
 	}()
 

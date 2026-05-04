@@ -1,3 +1,5 @@
+//go:build tpm_integration
+
 package crypto
 
 import (

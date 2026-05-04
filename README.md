@@ -1,90 +1,164 @@
 # vault-unsealer-tpm
 
-vault-unsealer-tpm is a service to automatically initialize and unseal a HashiCorp Vault using a TPM 2.0 device.
+vault-unsealer-tpm is a purpose-built tool for automatically unsealing a HashiCorp Vault instance using a TPM 2.0
+device. It is split into two binaries with distinct responsibilities:
 
-## Preparation
-An ideal setup involves up to four separate machines:
+- **`vault-unsealer-tpm`** (`cmd/unseal`) — a long-running daemon that monitors Vault and unseals it whenever it is
+  found sealed, using keys stored encrypted on disk and decrypted at runtime by the TPM.
+- **`vault-unsealer-tpm-init`** (`cmd/init`) — a one-shot, human-supervised CLI tool for provisioning the encrypted
+  key store. Run this once during setup; it does not run as a daemon.
 
-- A machine with a TPM 2.0 device that will run the `vault-unsealer-tpm` service.
-- A machine with a HashiCorp Vault server that will be initialized and unsealed.
-- A secure, ideally air-gapped machine to store the recovery keys.
-- A management machine used to decrypt and use the admin AppRole secret created during initialization.
+## Recommended Setup
 
-### Create Recovery Key Pair
-On the secure recovery machine, create a public key pair that will be used to encrypt the recovery keys:
+An ideal setup involves three separate machines:
+
+- A machine with a TPM 2.0 device that runs the `vault-unsealer-tpm` daemon and the `vault-unsealer-tpm-init` tool.
+- A machine running a HashiCorp Vault server.
+- A secure, ideally air-gapped machine to store recovery key backups.
+
+## Provisioning with `vault-unsealer-tpm-init`
+
+`vault-unsealer-tpm-init` has three subcommands. Run any with `-h` for its full flag reference.
+
+### `fresh` — Initialize a new Vault
+
+Use this when Vault has not yet been initialized. It initializes Vault, encrypts the unseal keys with the TPM, and
+optionally writes recovery-encrypted backups.
+
 ```sh
-openssl genpkey -algorithm RSA -out recovery.private.pem -pkeyopt rsa_keygen_bits:2048
+vault-unsealer-tpm-init fresh \
+  --vault.address https://vault.example.com:8200 \
+  --vault.tls.ca-cert /etc/vault/ca.pem \
+  --tpm.device-path /dev/tpmrm0 \
+  --tpm.handle 0x81010001 \
+  --store-path /etc/vault-unsealer/keys \
+  --key-shares 5 \
+  --key-threshold 3 \
+  --key-shares-saved 3 \
+  --recovery-public-key /path/to/recovery.public.pem
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--key-shares` | `5` | Total number of unseal key shares to generate |
+| `--key-threshold` | `3` | Number of shares required to unseal |
+| `--key-shares-saved` | `3` | Number of shares to encrypt with the TPM (must be ≥ threshold) |
+| `--recovery-public-key` | _(none)_ | Optional RSA public key path; if set, all shares are also encrypted as recovery backups |
+| `--vault.tls.skip-verify` | `false` | **INSECURE.** Skip TLS verification; only for bootstrap against a temporary certificate |
+
+The tool refuses to run if TPM-encrypted keys already exist at `--store-path`.
+
+After `fresh` completes, the root token is revoked. No AppRole or policy is created — use your standard Vault
+provisioning tooling (Terraform, Ansible, etc.) for that.
+
+### `adopt` — Adopt an existing Vault instance
+
+Use this when Vault is already initialized and you have the unseal keys. The keys are read from a file or stdin,
+encrypted with the TPM, and written to the store.
+
+```sh
+# From a file:
+vault-unsealer-tpm-init adopt \
+  --store-path /etc/vault-unsealer/keys \
+  --tpm.device-path /dev/tpmrm0 \
+  --tpm.handle 0x81010001 \
+  --keys-file /path/to/unseal-keys.txt
+
+# From stdin:
+vault-unsealer-tpm-init adopt \
+  --store-path /etc/vault-unsealer/keys \
+  --tpm.device-path /dev/tpmrm0 \
+  --tpm.handle 0x81010001
+```
+
+The keys file should contain one unseal key per line; blank lines and lines beginning with `#` are ignored.
+
+### `rekey` — Rotate the TPM key
+
+Use this when replacing the TPM or rotating the TPM key handle. The existing keys are decrypted with the old handle,
+re-encrypted under the new handle, and written atomically. The old handle is evicted unless `--keep-old-handle` is set.
+
+```sh
+vault-unsealer-tpm-init rekey \
+  --store-path /etc/vault-unsealer/keys \
+  --tpm.device-path /dev/tpmrm0 \
+  --tpm.handle 0x81010001 \
+  --tpm.new-handle 0x81010002
+```
+
+After rekeying, update the daemon's `--tpm.handle` flag to the new handle before restarting it.
+
+## Running the Daemon
+
+Once keys are in place, start the daemon:
+
+```sh
+vault-unsealer-tpm \
+  --vault.address https://vault.example.com:8200 \
+  --vault.tls.ca-cert /etc/vault/ca.pem \
+  --tpm.device-path /dev/tpmrm0 \
+  --tpm.handle 0x81010001 \
+  --store-path /etc/vault-unsealer/keys
+```
+
+The daemon polls Vault every 10 seconds. If Vault is sealed, it decrypts the stored keys with the TPM and submits
+them. It refuses to start if no TPM-encrypted key files are present at `--store-path`.
+
+**Daemon flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--vault.address` | `http://127.0.0.1:8200` | Vault server address |
+| `--vault.tls.ca-cert` | _(none)_ | Path to CA certificate for TLS verification |
+| `--vault.tls.server-name` | _(none)_ | Override TLS server name |
+| `--tpm.device-path` | `/dev/tpmrm0` | Path to the TPM device |
+| `--tpm.handle` | `0x81010001` | Persistent TPM handle holding the RSA key |
+| `--store-path` | `./keys` | Directory containing the `unseal-key-*.tpm.enc` files |
+
+TLS verification is always enforced in the daemon. There is no `--vault.tls.skip-verify` flag.
+
+## Recovery Procedure
+
+If the TPM is lost or damaged and recovery-encrypted backups were written during `fresh`:
+
+1. Transfer the `unseal-key-*.recovery.enc` files to the secure recovery machine.
+2. Decrypt each file using the recovery private key:
+
+```sh
+openssl pkeyutl -decrypt \
+  -inkey recovery.private.pem \
+  -in unseal-key-0.recovery.enc \
+  -pkeyopt rsa_padding_mode:oaep \
+  -pkeyopt rsa_oaep_md:sha256
+```
+
+3. Once you have the plaintext keys, use `vault-unsealer-tpm-init adopt` on a new TPM-equipped machine to re-provision
+   the key store.
+
+## Preparing a Recovery Key Pair
+
+On the secure recovery machine:
+
+```sh
+openssl genpkey -algorithm RSA -out recovery.private.pem -pkeyopt rsa_keygen_bits:4096
 openssl rsa -pubout -in recovery.private.pem -out recovery.public.pem
 ```
-Transport the `recovery.public.pem` file to the machine running the `vault-unsealer-tpm` service. This public key will
-be used to encrypt the unseal keys during initialization. 
 
-### Create Admin Secret Key Pair
-On the management machine, create a public key pair that will be used to encrypt the admin AppRole secret:
-```sh
-openssl genpkey -algorithm RSA -out admin.private.pem -pkeyopt rsa_keygen_bits:2048
-openssl rsa -pubout -in admin.private.pem -out admin.public.pem
-```
-Transport the `admin.public.pem` file to the machine running the `vault-unsealer-tpm` service. This public key will
-be used to encrypt the admin AppRole secret during initialization.
-
-## Features
-
-### Initialization
-If the given Vault is not initialized, the service will initialize it and store the unseal keys oon disk, by encrypting
-them with the TPM. Additionally, the unseal keys will also be encrypted using a given public key so that they can be saved
-off-device for recovery purposes.
-
-During initialization, the service will use the root token to create an admin policy and associated AppRole, and encrypt the
-AppRole secret with an additional public key. This allows to safely transport the AppRole secret to a management system or
-secret store. After this process, the root token will be revoked.
-
-The service will _not_ initialize a Vault if encrypted keys are already present on disk.
-
-**Important Flags**
-
-- `--tpm.handle`: The persistent handle for the TPM key used to encrypt and decrypt the unseal keys. Must be an RSA key
-                  and will be created if it does not exist.
-- `--vault.address`: The address of the Vault server to be initialized and unsealed.
-- `--vault.tls.skip-verify`: If set, the service will not verify the Vault server's TLS certificate during initialization.
-                            This can be required if the Vault server is set up with a temporary certificate until it can
-                            act as its own CA for TLS certificates.
-- `--vault.tls.ca-cert`: The CA certificate to use for verifying the Vault server's TLS certificate. Uses the system's
-                         default CA certificates if not set.
-- `--init.recovery-public-key`: The public key used to encrypt the unseal keys in addition to the TPM-based encryption.
-- `--init.admin-role-id`: The role ID of the AppRole to be created during initialization.
-- `--init.admin-public-key`: The public key used to encrypt the AppRole secret.
-- `--init.key-shares`: The number of unseal keys to be generated during initialization.
-- `--init.key-shares-saved`: The number of unseal keys to be saved on disk using the TPM encryption. Any remaining keys
-                             will only be encrypted with the recovery public key.
-- `--init.key-threshold`: The number of unseal keys required to unseal the Vault.
-
-### Unsealing
-If the given Vault is already initialized, the service will attempt to unseal it by decrypting and using the unseal keys
-stored on disk.
-
-## Using the initialized Vault
-Transport the encrypted admin AppRole secret (default: `keys/secret-admin.admin.enc`) to the management machine. On this
-machine, decrypt the admin AppRole secret using the following `openssl` command:
-
-```sh
-openssl pkeyutl -decrypt -inkey admin.private.pem -in secret-admin.admin.enc -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
-```
-This will output the decrypted AppRole secret, which can then be used to log in to the Vault server using the AppRole's
-role ID. Refer to the [Vault documentation](https://developer.hashicorp.com/vault/docs/auth/approle) for details.
-
-## Storing the Recovery Keys
-In the event that the TPM device is lost or damaged, the unseal keys can be recovered using the recovery key stored
-on the secure recovery machine. Therefore, transport all unseal keys encrypted with the recovery key (default:
-`keys/unseal-key-*.recovery.enc`) to the recovery machine or a secure storage device.
-
-If needed, decrypt the unseal keys using the following `openssl` command:
-
-```sh
-openssl pkeyutl -decrypt -inkey recovery.private.pem -in unseal-key-*.recovery.enc -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
-```
-
-A method to securely import the recovered unseal keys back into `vault-unsealer-tpm` is not yet implemented.
+Keep `recovery.private.pem` on the offline machine. Transfer only `recovery.public.pem` to the machine running the
+init tool.
 
 ## Tests
-Please note that the tests currently can only be run with a real TPM device and the associated privileges.
+
+Unit tests run without hardware:
+
+```sh
+go test ./...
+```
+
+Integration tests require a real TPM device and appropriate privileges:
+
+```sh
+go test -tags tpm_integration ./...
+```

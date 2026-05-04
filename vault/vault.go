@@ -4,30 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hashicorp/vault/api"
 	"log"
 	"time"
+
+	"github.com/hashicorp/vault/api"
 )
 
 type Vault struct {
-	client        *api.Client
-	tpmDevicePath string
-	tpmHandle     uint32
-}
-
-type InitResult struct {
-	RootToken string
-	Keys      []string
-}
-
-type CreateAdminAppRoleResult struct {
-	RoleID   string
-	SecretID string
-}
-
-type InitConfig struct {
-	InitKeyShares    int
-	InitKeyThreshold int
+	client *api.Client
 }
 
 type KeyStore interface {
@@ -39,27 +23,7 @@ func NewVault(vaultConfig *api.Config) (*Vault, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Vault client: %w", err)
 	}
-
-	return &Vault{
-		client: client,
-	}, nil
-}
-
-func (v *Vault) Initialize(cfg InitConfig) (*InitResult, error) {
-	log.Println("Initializing Vault...")
-	initReq := &api.InitRequest{
-		SecretShares:    cfg.InitKeyShares,
-		SecretThreshold: cfg.InitKeyThreshold,
-	}
-	resp, err := v.client.Sys().Init(initReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize Vault: %w", err)
-	}
-
-	return &InitResult{
-		RootToken: resp.RootToken,
-		Keys:      resp.Keys,
-	}, nil
+	return &Vault{client: client}, nil
 }
 
 func (v *Vault) IsInitialized() (bool, error) {
@@ -88,13 +52,10 @@ func (v *Vault) UnsealLoop(ctx context.Context, store KeyStore) error {
 				unsealed, err := v.Unseal(store)
 				if err != nil {
 					log.Printf("Failed to Unseal Vault: %v", err)
+				} else if unsealed {
+					log.Println("Vault is now unsealed.")
 				} else {
-					log.Println("Vault Unseal attempt completed.")
-					if unsealed {
-						log.Println("Vault is now unsealed.")
-					} else {
-						log.Println("Vault remains sealed after Unseal attempts.")
-					}
+					log.Println("Vault remains sealed after Unseal attempts.")
 				}
 			}
 		}
@@ -119,75 +80,9 @@ func (v *Vault) Unseal(store KeyStore) (bool, error) {
 
 		if !status.Sealed {
 			log.Println("Vault successfully unsealed.")
-			return true, nil // Stop sending keys if unsealed
+			return true, nil
 		}
 	}
 
 	return false, nil
-}
-
-// CreateAdminAppRole uses the root token to create an admin policy and AppRole,
-// saves the encrypted secret ID, and revokes the root token.
-func (v *Vault) CreateAdminAppRole(adminRoleID string, rootToken string) (*CreateAdminAppRoleResult, error) {
-	log.Println("Using root token to create admin AppRole...")
-	v.client.SetToken(rootToken)
-	defer v.client.ClearToken()
-
-	// 1. Create admin policy
-	adminPolicy := `path "*" { capabilities = ["create", "read", "update", "delete", "list", "sudo"] }`
-	log.Println("Creating admin policy...")
-	if err := v.client.Sys().PutPolicy("admin", adminPolicy); err != nil {
-		return nil, fmt.Errorf("failed to create admin policy: %w", err)
-	}
-
-	// 2. Enable AppRole auth backend if not already enabled
-	auths, err := v.client.Sys().ListAuth()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list auth backends: %w", err)
-	}
-	if _, ok := auths["approle/"]; !ok {
-		log.Println("Enabling AppRole auth backend...")
-		if err := v.client.Sys().EnableAuthWithOptions("approle", &api.EnableAuthOptions{Type: "approle"}); err != nil {
-			return nil, fmt.Errorf("failed to enable approle auth backend: %w", err)
-		}
-	}
-
-	// 3. Create admin AppRole
-	log.Printf("Creating admin AppRole with role name: %s", adminRoleID)
-	_, err = v.client.Logical().Write(fmt.Sprintf("auth/approle/role/%s", adminRoleID), map[string]interface{}{
-		"policies": []string{"admin"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create admin approle: %w", err)
-	}
-
-	// 4. Set AppRole Role ID to Role Name
-	log.Printf("Updating admin AppRole to role ID: %s", adminRoleID)
-	_, err = v.client.Logical().Write(fmt.Sprintf("auth/approle/role/%s/role-id", adminRoleID), map[string]interface{}{
-		"role_id": adminRoleID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to update admin approle: %w", err)
-	}
-
-	// 5. Generate the Secret ID
-	secretIDResp, err := v.client.Logical().Write(fmt.Sprintf("auth/approle/role/%s/secret-id", adminRoleID), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate secret id: %w", err)
-	}
-	secretID := secretIDResp.Data["secret_id"].(string)
-
-	return &CreateAdminAppRoleResult{
-		RoleID:   adminRoleID,
-		SecretID: secretID,
-	}, nil
-}
-
-func (v *Vault) RevokeToken(token string) error {
-	log.Printf("Revoking token %s...", token)
-	if err := v.client.Auth().Token().RevokeSelf(token); err != nil {
-		return fmt.Errorf("failed to revoke token %s: %w", token, err)
-	}
-	log.Println("Token revoked successfully.")
-	return nil
 }

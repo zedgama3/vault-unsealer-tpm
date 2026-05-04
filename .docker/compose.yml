@@ -1,0 +1,82 @@
+# Example Docker Compose file for vault-unsealer-tpm.
+#
+# This file is intended as documentation and a starting point, not a
+# production-ready deployment. Review every value before use.
+#
+# Usage:
+#   docker compose -f .docker/compose.yml up -d
+#
+# Prerequisites:
+#   1. Run vault-unsealer-tpm-init on the host to populate the key store.
+#   2. Create the external volume:
+#        docker volume create vault-unsealer-keys
+#   3. Copy your Vault CA certificate into ./certs/ca.pem (or adjust the bind mount).
+#   4. Set any environment variables you wish to override (see below).
+
+services:
+  vault-unsealer-tpm:
+    build:
+      # Build context is the repository root so all Go source is available.
+      context: ..
+      dockerfile: .docker/Dockerfile
+
+    # Use a specific published image instead of building locally:
+    # image: arestless/vault-unsealer-tpm:latest
+
+    restart: unless-stopped
+
+    # Pass the TPM device through from the host.
+    # Use /dev/tpmrm0 (resource manager) in preference to /dev/tpm0 (direct)
+    # to avoid conflicts with other TPM users on the host.
+    devices:
+      - /dev/tpmrm0:/dev/tpmrm0
+
+    volumes:
+      # Named volume holding the TPM-encrypted unseal key files.
+      # Mounted read-only — the daemon only decrypts keys, never writes them.
+      # Populate this volume by running vault-unsealer-tpm-init on the host first.
+      - vault-unsealer-keys:/keys:ro
+
+      # Bind mount for TLS certificates. Adjust the host path as needed.
+      # Must contain at minimum the CA certificate referenced by
+      # VAULT_UNSEALER_VAULT_TLS_CA_CERT below.
+      - ./certs:/certs:ro
+
+    environment:
+      # Address of the Vault server. Required.
+      VAULT_UNSEALER_VAULT_ADDR: "https://vault.example.com:8200"
+
+      # Path inside the container to the CA certificate used to verify
+      # the Vault server's TLS certificate. Corresponds to the /certs bind mount above.
+      VAULT_UNSEALER_VAULT_TLS_CA_CERT: "/certs/ca.pem"
+
+      # Override the TLS server name (SNI). Leave unset unless your Vault certificate
+      # does not match the hostname in VAULT_UNSEALER_VAULT_ADDR.
+      # VAULT_UNSEALER_VAULT_TLS_SERVER_NAME: ""
+
+      # Path inside the container to the directory containing unseal-key-*.tpm.enc files.
+      # Should match the /keys volume mount above. The default is already /keys when
+      # using this Compose file, but it is shown here explicitly for clarity.
+      VAULT_UNSEALER_STORE_PATH: "/keys"
+
+      # Path to the TPM device inside the container. Must match the device mapping above.
+      VAULT_UNSEALER_TPM_DEVICE: "/dev/tpmrm0"
+
+      # Persistent TPM handle. Must match the handle used during vault-unsealer-tpm-init.
+      # Accepts decimal or 0x-prefixed hex.
+      VAULT_UNSEALER_TPM_HANDLE: "0x81010001"
+
+    # Prevent the container writing to its own filesystem.
+    # The /keys volume is mounted read-only; nothing else needs to be writable.
+    read_only: true
+
+    security_opt:
+      # Prevent privilege escalation inside the container.
+      - no-new-privileges:true
+
+# The key store volume must exist before starting the stack.
+# Create it with: docker volume create vault-unsealer-keys
+# Then populate it by running vault-unsealer-tpm-init on the host.
+volumes:
+  vault-unsealer-keys:
+    external: true

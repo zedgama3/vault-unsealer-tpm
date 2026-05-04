@@ -13,9 +13,8 @@ RUN go mod download
 # Copy the rest of the application source code
 COPY . .
 
-# Build the application for a static build
-# The application is placed in the root of the builder stage
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /vault-unsealer-tpm ./cmd
+# Build the daemon binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /vault-unsealer-tpm ./cmd/unseal
 
 # Stage 2: Create the final image
 FROM scratch

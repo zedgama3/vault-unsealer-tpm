@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+# https://taskfile.dev
+version: "3"
+
+vars:
+  BIN_DIR: bin
+  MODULE:
+    sh: go list -m
+
+tasks:
+  default:
+    desc: List all available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build both binaries into ./bin/
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - go build -o {{.BIN_DIR}}/vault-unsealer-tpm ./cmd/unseal
+      - go build -o {{.BIN_DIR}}/vault-unsealer-tpm-init ./cmd/init
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BIN_DIR}}/vault-unsealer-tpm"
+      - "{{.BIN_DIR}}/vault-unsealer-tpm-init"
+
+  build-docker:
+    desc: Build the daemon Docker image tagged as vault-unsealer-tpm:dev
+    cmds:
+      - docker build -f .docker/Dockerfile -t vault-unsealer-tpm:dev .
+
+  test:
+    desc: Run all unit tests
+    cmds:
+      - go test ./...
+
+  test-integration:
+    desc: Run TPM integration tests (requires a real TPM device and privileges)
+    cmds:
+      - go test -tags tpm_integration ./...
+
+  lint:
+    desc: Format code and run golangci-lint
+    cmds:
+      - gofmt -w .
+      - go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run ./...
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BIN_DIR}}
