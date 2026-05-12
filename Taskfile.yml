@@ -15,21 +15,19 @@ tasks:
       - task --list
 
   build:
-    desc: Build both binaries into ./bin/
+    desc: Build the binary into ./bin/
     cmds:
       - mkdir -p {{.BIN_DIR}}
       - go build -o {{.BIN_DIR}}/vault-unsealer-tpm ./cmd/unseal
-      - go build -o {{.BIN_DIR}}/vault-unsealer-tpm-init ./cmd/init
     sources:
       - "**/*.go"
       - go.mod
       - go.sum
     generates:
       - "{{.BIN_DIR}}/vault-unsealer-tpm"
-      - "{{.BIN_DIR}}/vault-unsealer-tpm-init"
 
   build-docker:
-    desc: Build the daemon Docker image tagged as vault-unsealer-tpm:dev
+    desc: Build the Docker image tagged as vault-unsealer-tpm:dev
     cmds:
       - docker build -f .docker/Dockerfile -t vault-unsealer-tpm:dev .
 

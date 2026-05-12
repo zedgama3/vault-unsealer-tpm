@@ -2,3 +2,7 @@
 keys
 .task/
 bin/
+/init
+/unseal
+/vault-unsealer-tpm
+/vault-unsealer-tpm-init

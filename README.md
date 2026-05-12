@@ -1,163 +1,128 @@
 # vault-unsealer-tpm
 
-vault-unsealer-tpm is a purpose-built tool for automatically unsealing a HashiCorp Vault instance using a TPM 2.0
-device. It is split into two binaries with distinct responsibilities:
+`vault-unsealer-tpm` automatically unseals HashiCorp Vault with unseal keys that are stored on disk encrypted by a
+TPM 2.0 device.
 
-- **`vault-unsealer-tpm`** (`cmd/unseal`) — a long-running daemon that monitors Vault and unseals it whenever it is
-  found sealed, using keys stored encrypted on disk and decrypted at runtime by the TPM.
-- **`vault-unsealer-tpm-init`** (`cmd/init`) — a one-shot, human-supervised CLI tool for provisioning the encrypted
-  key store. Run this once during setup; it does not run as a daemon.
+There is one binary and one Docker image:
 
-## Recommended Setup
+- Run mode, the default: a long-running daemon that watches Vault and unseals it when needed.
+- Init mode, enabled with `-init`: a one-shot interactive setup command that initializes a new Vault or adopts keys
+  for an already-initialized Vault.
 
-An ideal setup involves three separate machines:
+## Docker Compose
 
-- A machine with a TPM 2.0 device that runs the `vault-unsealer-tpm` daemon and the `vault-unsealer-tpm-init` tool.
-- A machine running a HashiCorp Vault server.
-- A secure, ideally air-gapped machine to store recovery key backups.
+Edit [.docker/compose.yml](.docker/compose.yml), especially the Vault address, TLS CA path, TPM device, and TPM handle.
+The run and init services intentionally share the same image, environment, device, and key volume.
 
-## Provisioning with `vault-unsealer-tpm-init`
-
-`vault-unsealer-tpm-init` has three subcommands. Run any with `-h` for its full flag reference.
-
-### `fresh` — Initialize a new Vault
-
-Use this when Vault has not yet been initialized. It initializes Vault, encrypts the unseal keys with the TPM, and
-optionally writes recovery-encrypted backups.
+Initialize or adopt keys:
 
 ```sh
-vault-unsealer-tpm-init fresh \
-  --vault.address https://vault.example.com:8200 \
-  --vault.tls.ca-cert /etc/vault/ca.pem \
-  --tpm.device-path /dev/tpmrm0 \
-  --tpm.handle 0x81010001 \
-  --store-path /etc/vault-unsealer/keys \
-  --key-shares 5 \
-  --key-threshold 3 \
-  --key-shares-saved 3 \
-  --recovery-public-key /path/to/recovery.public.pem
+docker compose -f .docker/compose.yml --profile init run --rm unsealer-init
 ```
 
-**Key flags:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--key-shares` | `5` | Total number of unseal key shares to generate |
-| `--key-threshold` | `3` | Number of shares required to unseal |
-| `--key-shares-saved` | `3` | Number of shares to encrypt with the TPM (must be ≥ threshold) |
-| `--recovery-public-key` | _(none)_ | Optional RSA public key path; if set, all shares are also encrypted as recovery backups |
-| `--vault.tls.skip-verify` | `false` | **INSECURE.** Skip TLS verification; only for bootstrap against a temporary certificate |
-
-The tool refuses to run if TPM-encrypted keys already exist at `--store-path`.
-
-After `fresh` completes, the root token is revoked. No AppRole or policy is created — use your standard Vault
-provisioning tooling (Terraform, Ansible, etc.) for that.
-
-### `adopt` — Adopt an existing Vault instance
-
-Use this when Vault is already initialized and you have the unseal keys. The keys are read from a file or stdin,
-encrypted with the TPM, and written to the store.
+Pass init flags when you want non-default shares. Include `-init` because `docker compose run SERVICE ...` replaces
+the service command:
 
 ```sh
-# From a file:
-vault-unsealer-tpm-init adopt \
-  --store-path /etc/vault-unsealer/keys \
-  --tpm.device-path /dev/tpmrm0 \
-  --tpm.handle 0x81010001 \
-  --keys-file /path/to/unseal-keys.txt
-
-# From stdin:
-vault-unsealer-tpm-init adopt \
-  --store-path /etc/vault-unsealer/keys \
-  --tpm.device-path /dev/tpmrm0 \
-  --tpm.handle 0x81010001
+docker compose -f .docker/compose.yml --profile init run --rm unsealer-init \
+  -init -key-shares=5 -key-threshold=3 -key-shares-saved=3
 ```
 
-The keys file should contain one unseal key per line; blank lines and lines beginning with `#` are ignored.
-
-### `rekey` — Rotate the TPM key
-
-Use this when replacing the TPM or rotating the TPM key handle. The existing keys are decrypted with the old handle,
-re-encrypted under the new handle, and written atomically. The old handle is evicted unless `--keep-old-handle` is set.
+Start the daemon after init completes:
 
 ```sh
-vault-unsealer-tpm-init rekey \
-  --store-path /etc/vault-unsealer/keys \
-  --tpm.device-path /dev/tpmrm0 \
-  --tpm.handle 0x81010001 \
-  --tpm.new-handle 0x81010002
+docker compose -f .docker/compose.yml up -d vault-unsealer-tpm
 ```
 
-After rekeying, update the daemon's `--tpm.handle` flag to the new handle before restarting it.
+## Init Mode
 
-## Running the Daemon
+Init mode chooses the action from Vault's current state:
 
-Once keys are in place, start the daemon:
+- If Vault is not initialized, it initializes Vault, encrypts the configured number of unseal keys with the TPM, writes
+  them to the key store, unseals Vault once, and prints the generated unseal keys and root token.
+- If Vault is already initialized, it adopts existing unseal keys from `-keys-file` or prompts for them interactively.
+
+If key files already exist, init asks whether to delete them and then requires this exact confirmation:
+
+```text
+delete keys
+```
+
+Only tool-owned files are deleted: `unseal-key-*.tpm.enc` and legacy `unseal-key-*.recovery.enc`.
+
+Host example:
+
+```sh
+vault-unsealer-tpm -init \
+  -vault.address=https://vault.example.com:8200 \
+  -vault.tls.ca-cert=/etc/vault/ca.pem \
+  -store-path=/etc/vault-unsealer/keys \
+  -tpm.device-path=/dev/tpmrm0 \
+  -tpm.handle=0x81010001
+```
+
+Adopt an existing Vault without prompts:
+
+```sh
+vault-unsealer-tpm -init -keys-file ./unseal-keys.txt
+```
+
+The keys file must contain one unseal key per line. Blank lines and lines beginning with `#` are ignored.
+
+## Run Mode
+
+Run mode reads configuration from environment variables or flags and never prompts:
 
 ```sh
 vault-unsealer-tpm \
-  --vault.address https://vault.example.com:8200 \
-  --vault.tls.ca-cert /etc/vault/ca.pem \
-  --tpm.device-path /dev/tpmrm0 \
-  --tpm.handle 0x81010001 \
-  --store-path /etc/vault-unsealer/keys
+  -vault.address=https://vault.example.com:8200 \
+  -vault.tls.ca-cert=/etc/vault/ca.pem \
+  -store-path=/etc/vault-unsealer/keys \
+  -tpm.device-path=/dev/tpmrm0 \
+  -tpm.handle=0x81010001
 ```
 
-The daemon polls Vault every 10 seconds. If Vault is sealed, it decrypts the stored keys with the TPM and submits
-them. It refuses to start if no TPM-encrypted key files are present at `--store-path`.
+The daemon expects `unseal-key-*.tpm.enc` files to already exist in the key store. Mount the key store read-only in
+run mode.
 
-**Daemon flags:**
+## Configuration
 
-| Flag | Default | Description |
+Flags override environment variables.
+
+| Environment variable | Flag | Default |
 |---|---|---|
-| `--vault.address` | `http://127.0.0.1:8200` | Vault server address |
-| `--vault.tls.ca-cert` | _(none)_ | Path to CA certificate for TLS verification |
-| `--vault.tls.server-name` | _(none)_ | Override TLS server name |
-| `--tpm.device-path` | `/dev/tpmrm0` | Path to the TPM device |
-| `--tpm.handle` | `0x81010001` | Persistent TPM handle holding the RSA key |
-| `--store-path` | `./keys` | Directory containing the `unseal-key-*.tpm.enc` files |
+| `VAULT_UNSEALER_VAULT_ADDR` | `-vault.address` | `http://127.0.0.1:8200` |
+| `VAULT_UNSEALER_VAULT_TLS_CA_CERT` | `-vault.tls.ca-cert` | empty |
+| `VAULT_UNSEALER_VAULT_TLS_SERVER_NAME` | `-vault.tls.server-name` | empty |
+| `VAULT_UNSEALER_STORE_PATH` | `-store-path` | `./keys` |
+| `VAULT_UNSEALER_TPM_DEVICE` | `-tpm.device-path` | `/dev/tpmrm0` |
+| `VAULT_UNSEALER_TPM_HANDLE` | `-tpm.handle` | `0x81010001` |
 
-TLS verification is always enforced in the daemon. There is no `--vault.tls.skip-verify` flag.
+Init-only flags:
 
-## Recovery Procedure
+| Flag | Default |
+|---|---|
+| `-key-shares` | `5` |
+| `-key-threshold` | `3` |
+| `-key-shares-saved` | `3` |
+| `-keys-file` | empty; prompt when adopting |
 
-If the TPM is lost or damaged and recovery-encrypted backups were written during `fresh`:
+## Scope
 
-1. Transfer the `unseal-key-*.recovery.enc` files to the secure recovery machine.
-2. Decrypt each file using the recovery private key:
+Kept or added: auto-unseal daemon, fresh initialization, adoption of existing keys, TPM-backed key encryption,
+TLS CA/server-name configuration, Docker Compose usage, direct Docker/host usage, `-init`, interactive prompts, and
+safe deletion confirmation.
 
-```sh
-openssl pkeyutl -decrypt \
-  -inkey recovery.private.pem \
-  -in unseal-key-0.recovery.enc \
-  -pkeyopt rsa_padding_mode:oaep \
-  -pkeyopt rsa_oaep_md:sha256
-```
-
-3. Once you have the plaintext keys, use `vault-unsealer-tpm-init adopt` on a new TPM-equipped machine to re-provision
-   the key store.
-
-## Preparing a Recovery Key Pair
-
-On the secure recovery machine:
-
-```sh
-openssl genpkey -algorithm RSA -out recovery.private.pem -pkeyopt rsa_keygen_bits:4096
-openssl rsa -pubout -in recovery.private.pem -out recovery.public.pem
-```
-
-Keep `recovery.private.pem` on the offline machine. Transfer only `recovery.public.pem` to the machine running the
-init tool.
+Removed: the separate init binary, init subcommands, AppRole bootstrap setup, root-token revocation, RSA recovery
+backup files, TPM rekey/export commands, and duplicate Docker docs.
 
 ## Tests
-
-Unit tests run without hardware:
 
 ```sh
 go test ./...
 ```
 
-Integration tests require a real TPM device and appropriate privileges:
+TPM integration tests require hardware:
 
 ```sh
 go test -tags tpm_integration ./...

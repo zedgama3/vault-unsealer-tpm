@@ -1,6 +1,6 @@
 package config
 
-// Config holds the unseal daemon's configuration, populated from command-line flags.
+// Config holds settings shared by run and init modes.
 type Config struct {
 	StorePath string
 
